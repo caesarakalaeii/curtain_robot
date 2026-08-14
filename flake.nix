@@ -18,9 +18,13 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
-    # `...` rather than a closed { self, nixpkgs }: adding a second input later
-    # would otherwise fail with "called with unexpected argument 'self'".
-    { nixpkgs, ... }:
+    # `self` is bound because every command has to know where this repo IS --
+    # its own source path is the only anchor that survives being invoked as
+    # `nix run /path/to/repo#lint` from an unrelated directory (see
+    # rootPreamble). `...` rather than a closed { self, nixpkgs } all the same:
+    # adding a second input later would otherwise fail with "called with
+    # unexpected argument '<that input>'".
+    { self, nixpkgs, ... }:
     let
       lib = nixpkgs.lib;
 
@@ -141,14 +145,37 @@
       # are deployed as-is, there is no artifact.
       #
       # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time, and
-      # it runs in the caller's current directory so an agent can test
-      # uncommitted edits. Rules for writing one:
+      # it runs with the repo root as its cwd (see `wrappers`) so that a verb
+      # behaves the same however it was invoked, while still seeing uncommitted
+      # edits when there is a checkout. Rules for writing one:
       #   * always end with a quoted "$@" -- unquoted $@ fails the build (SC2068)
-      #   * $REPO_ROOT is pre-set to the git top level; use it for anything
-      #     stateful ("$REPO_ROOT/.venv"), never a bare relative path
+      #   * a bare "$@" must never be the ONLY path argument: with no arguments
+      #     the tool then walks its own default of ".", and that used to be the
+      #     caller's directory. Default it -- "${@:-$REPO_ROOT}" -- or name the
+      #     files under $REPO_ROOT outright, as `test` and `run` do
+      #   * $REPO_ROOT is this repo from any cwd, and $REPO_SRC is the read-only
+      #     store copy of it; they are equal exactly when no checkout was found,
+      #     which is how a MUTATING verb detects that it has nothing to write to
+      #   * use $REPO_ROOT for anything stateful ("$REPO_ROOT/.venv"), never a
+      #     bare relative path
       #   * pass the batch/non-interactive flag to anything that could prompt:
       #     there is no tty, so a prompt hangs until the agent's timeout
       #   * say "(network)" in the description of anything that needs it
+
+      # ruff insists on a .ruff_cache/ in the project root it was pointed at, and
+      # it does not degrade gracefully when that root is read-only: outside a
+      # checkout it exited 2 with `Failed to create temporary file ...
+      # /nix/store/...-source/.ruff_cache/...` and linted nothing -- a false RED
+      # to replace the old false GREEN. So redirect the cache in exactly that
+      # case. Inside a checkout the default .ruff_cache/ is kept (it ships its
+      # own .gitignore, so it never shows up in `git status`) and repeat runs
+      # stay warm. $UID keeps two users out of each other's /tmp directory.
+      ruffCachePreamble = ''
+        if [ "$REPO_ROOT" = "$REPO_SRC" ]; then
+          export RUFF_CACHE_DIR="''${TMPDIR:-/tmp}/ruff-cache-$UID"
+        fi
+      '';
+
       commands = pkgs: {
         test = {
           # A bare `python3` is correct here, unlike in the venv-shaped repos in
@@ -169,12 +196,33 @@
           # issues, mostly in the vendored micropyserver.py/utils.py/VL53L0X.py
           # plus a real F821 (test.py calls an undefined `connect()`). A cold
           # agent must not read that exit code as "the flake is broken".
-          description = "ruff check (exits 1: 23 pre-existing findings in tree)";
-          text = ''ruff check "$@"'';
+          #
+          # Those 23 are also what it reports from an unrelated directory, which
+          # is the point of the default below: with a bare "$@" this gate went
+          # green on an empty cwd, and a check that passes by looking at nothing
+          # is worse than no check at all.
+          description = "ruff check the whole repo, from any cwd (exits 1: 23 pre-existing findings in tree)";
+          text = ''
+            ${ruffCachePreamble}
+            ruff check "''${@:-$REPO_ROOT}"
+          '';
         };
         fmt = {
-          description = "ruff format (rewrites files)";
-          text = ''ruff format "$@"'';
+          # MUTATING, so this one refuses instead of half-working. With no
+          # checkout in sight $REPO_ROOT is the read-only store copy of this
+          # flake and `ruff format` would emit "Permission denied" per file; the
+          # one thing it must never do is fall back to the caller's directory and
+          # rewrite files that are not ours. Explicit arguments are still
+          # honoured -- the cd in `wrappers` keeps a relative one inside the repo.
+          description = "ruff format the repo (rewrites files, so it needs a checkout)";
+          text = ''
+            if [ "$#" -eq 0 ] && [ "$REPO_ROOT" = "$REPO_SRC" ]; then
+              echo "dev-fmt rewrites files and found no checkout to rewrite: run it from inside a clone of this repo, or name paths explicitly" >&2
+              exit 1
+            fi
+            ${ruffCachePreamble}
+            ruff format "''${@:-$REPO_ROOT}"
+          '';
         };
         run = {
           # NEEDS HARDWARE, and this could not be validated when the flake was
@@ -184,6 +232,12 @@
           #
           # test.py and test_utils.py are deliberately not copied -- the former is
           # an abandoned scratch script, the latter is host-only.
+          #
+          # Every source is named under $REPO_ROOT, so this deploys THIS repo
+          # whatever the cwd, and never some same-named file next to the caller.
+          # Outside a checkout $REPO_ROOT is $REPO_SRC, which cannot contain the
+          # gitignored my_secrets.py, so the guard below is also what stops this
+          # verb from flashing a board from the store copy.
           description = "copy the firmware to a USB-attached board and start main.py (needs hardware + my_secrets.py)";
           text = ''
             # my_secrets.py is gitignored (it holds the WLAN credentials) and
@@ -211,6 +265,10 @@
       # ======================================================================
       # GENERIC MACHINERY -- byte-identical in all 41 repos, do not edit
       # ======================================================================
+      # `rootPreamble` and the cd in `wrappers` below were edited once, to fix
+      # the anchoring bug described at each of them. That edit belongs in all 41
+      # copies: a repo left on the old `git rev-parse ... || pwd` version still
+      # lints and formats whatever directory it is called from.
 
       # Prepend, never assign: a host LD_LIBRARY_PATH may be carrying something
       # the user needs, and clobbering it breaks binaries they launch from here.
@@ -222,13 +280,40 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # Every command gets $REPO_ROOT. `nix run` and `nix develop` both start in
-      # whatever directory they were invoked from, so a bare `.venv` silently
-      # forks a second environment as soon as an agent works from a subdirectory.
-      # Note we do NOT cd there: commands act on the caller's cwd on purpose.
+      # Every command gets $REPO_ROOT, and it points at THIS repo -- never at
+      # the caller's cwd. That distinction is the whole point: the first cut of
+      # this file resolved `git rev-parse --show-toplevel 2>/dev/null || pwd`,
+      # which is the caller's tree, and `nix run /path/to/repo#<verb>` (the form
+      # CI and a cold agent use) then acted on wherever it was launched from --
+      # `#lint` in an empty directory printed "All checks passed!" and exited 0
+      # after inspecting zero files, and `#fmt` reformatted the .py files it
+      # found there.
+      #
+      # $REPO_SRC is this flake's own source, baked in at build time, so it is
+      # correct from any cwd on any machine. It is the read-only store copy of
+      # the git-tracked tree -- exactly what a flake URL denotes -- so the
+      # read-only verbs work from anywhere and report the same findings they do
+      # in a clone.
+      #
+      # A live checkout still wins when the caller genuinely stands in THIS
+      # repo, so an agent can lint or format uncommitted edits. "Genuinely this
+      # repo" means the checkout's flake.nix is byte-identical to the one these
+      # wrappers were built from; if it differs, the wrapper on PATH was not
+      # built from that tree and has no business reading or rewriting it. That
+      # is the `cd ~/other-repo && nix run /path/to/this-repo#fmt` case, which a
+      # bare git-toplevel lookup happily reformatted.
+      #
+      # `$(<file)` is a bash redirection builtin, so the comparison forks no
+      # process and needs nothing on PATH but git.
       rootPreamble = ''
-        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-        export REPO_ROOT
+        REPO_SRC=${lib.escapeShellArg self}
+        REPO_ROOT="$REPO_SRC"
+        devCheckout="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -n "$devCheckout" ] && [ -f "$devCheckout/flake.nix" ] && [ "$(<"$devCheckout/flake.nix")" = "$(<"$REPO_SRC/flake.nix")" ]; then
+          REPO_ROOT="$devCheckout"
+        fi
+        unset devCheckout
+        export REPO_SRC REPO_ROOT
       '';
 
       # One derivation per command, reused by both `apps` and the dev shell, so
@@ -247,6 +332,15 @@
             text = ''
               ${rootPreamble}
               ${ldPreamble pkgs}
+              # Every verb runs FROM the repo root. Defaulting each path argument
+              # to "$REPO_ROOT" (below) covers the no-argument case, but only
+              # this cd covers the flag-only one: `dev-lint --fix` expands to a
+              # non-empty "$@" with no path in it, and ruff would then fall back
+              # to its own default of "." -- the caller's directory -- and
+              # rewrite it. Consequence to know about: a relative path you pass
+              # is relative to the repo root, not to your cwd, which is also what
+              # makes it impossible for one to escape the repo.
+              cd "$REPO_ROOT"
               ${cmd.text}
             '';
           }
@@ -352,6 +446,58 @@
                   exit 1
                 }
               done
+              touch "$out"
+            '';
+
+        # A regression test for the defect this flake shipped with, and it does
+        # fail against the old command texts -- it is not decoration. The build
+        # sandbox is an ideal stand-in for "some unrelated directory": it is not
+        # a git repo and it is not this repo, which is precisely the situation in
+        # which `nix run /path/to/repo#<verb>` used to act on the caller.
+        anchoring =
+          pkgs.runCommand "anchoring-check"
+            {
+              nativeBuildInputs = lib.attrValues (wrappers pkgs);
+            }
+            ''
+              printf 'import os,sys\nx=1\n' > decoy.py
+              cp decoy.py decoy.py.orig
+
+              # A mutating verb with nothing to write to must fail, not wander.
+              if dev-fmt; then
+                echo "dev-fmt succeeded outside a checkout: it wrote something" >&2
+                exit 1
+              fi
+              cmp decoy.py decoy.py.orig || {
+                echo "dev-fmt rewrote a file outside the repo" >&2
+                exit 1
+              }
+
+              # ... and a read-only verb must inspect the repo, not the caller.
+              # decoy.py is worth 3 ruff findings, so a lint that walked this
+              # directory could not stay quiet about it. Both argument shapes are
+              # exercised: no arguments at all (where the old text let ruff
+              # default to ".") and flag-only (where a path default is not enough
+              # on its own and the cd carries it).
+              dev-lint > lint.log 2>&1 || true
+              ! grep -q 'decoy\.py' lint.log || {
+                echo "dev-lint inspected the caller's directory" >&2
+                exit 1
+              }
+
+              # --show-files also pins down the positive half -- that it really
+              # did look at this repo -- and stays true if the 23 findings are
+              # ever cleaned up.
+              dev-lint --show-files > files.txt
+              grep -q '/test_utils\.py$' files.txt || {
+                echo "dev-lint did not see this repo's files" >&2
+                exit 1
+              }
+              ! grep -q 'decoy\.py' files.txt || {
+                echo "dev-lint --show-files inspected the caller's directory" >&2
+                exit 1
+              }
+
               touch "$out"
             '';
       });
